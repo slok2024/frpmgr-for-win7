@@ -1,5 +1,6 @@
 FRP Manager for win7
 
+更新frp版本到v0.66.0
 
 
 为了达成这个 Windows 7 完美兼容版，我们在整个过程中一共修改了 3 个核心 .go 文件（如果算上之前修复图标崩溃的 icon.go，则是 4 个）。
@@ -51,13 +52,22 @@ FRP Manager for win7
 
 
 使用的编译命令：
+
 go clean -cache
+
 go clean -modcache
+
 go mod tidy
+
 go mod download
+
 set GOARCH=386或set GOARCH=amd64
+
 set GOOS=windows
+
 set CGO_ENABLED=0
+
 go generate ./...
+
 go build -trimpath -ldflags="-s -w -H windowsgui" -o frpmgr_win7_final.exe ./cmd/frpmgr
 
