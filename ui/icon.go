@@ -22,7 +22,17 @@ func loadIcon(id res.Icon, size int) (icon *walk.Icon) {
 	} else {
 		icon, err = walk.NewIconFromSysDLLWithSize(id.Dll, id.Index, size)
 	}
-	if err == nil {
+
+	// 【核心修复】如果加载失败，绝对不能返回 nil。
+	// 使用 walk 系统内建图标作为保底，防止 walk 库在调用 Icon.Size() 时崩溃。
+	if err != nil || icon == nil {
+		icon = walk.IconError()
+		if icon == nil {
+			icon = walk.IconInformation()
+		}
+	}
+
+	if icon != nil {
 		cachedIconsForWidthAndId[widthAndId{size, id}] = icon
 	}
 	return
@@ -53,7 +63,9 @@ func iconForConfigState(state consts.ConfigState, size int) (icon *walk.Icon) {
 	default:
 		icon = loadIcon(res.IconStateWorking, size)
 	}
-	cachedIconsForWidthAndConfigState[widthAndConfigState{size, state}] = icon
+	if icon != nil {
+		cachedIconsForWidthAndConfigState[widthAndConfigState{size, state}] = icon
+	}
 	return
 }
 
@@ -77,7 +89,9 @@ func iconForProxyState(state consts.ProxyState, size int) (icon *walk.Icon) {
 	default:
 		icon = loadIcon(res.IconStateStopped, size)
 	}
-	cachedIconsForWidthAndProxyState[widthAndProxyState{size, state}] = icon
+	if icon != nil {
+		cachedIconsForWidthAndProxyState[widthAndProxyState{size, state}] = icon
+	}
 	return
 }
 
@@ -116,7 +130,6 @@ func drawCopyIcon(canvas *walk.Canvas, color walk.Color) error {
 
 	bounds := rectangle(5, 5, 8, 9)
 	startPoint := point(3, 3)
-	// Ensure the gap between two graphics
 	if penWidth := walk.IntFrom96DPI(pen.Width(), dpi); bounds.X-(startPoint.X+(penWidth-1)/2) < 2 {
 		bounds.X++
 		bounds.Y++
@@ -125,23 +138,24 @@ func drawCopyIcon(canvas *walk.Canvas, color walk.Color) error {
 	if err = canvas.DrawRectanglePixels(pen, bounds); err != nil {
 		return err
 	}
-	// Outer line: (2, 2) -> (10, 2)
 	if err = canvas.DrawLinePixels(pen, startPoint, point(9, 3)); err != nil {
 		return err
 	}
-	// Outer line: (2, 2) -> (2, 11)
 	if err = canvas.DrawLinePixels(pen, startPoint, point(3, 10)); err != nil {
 		return err
 	}
 	return nil
 }
 
-// flipIcon rotates an icon 180 degrees.
 func flipIcon(id res.Icon, size int) *walk.PaintFuncImage {
 	size96dpi := walk.Size{Width: size, Height: size}
 	return walk.NewPaintFuncImagePixels(size96dpi, func(canvas *walk.Canvas, bounds walk.Rectangle) error {
 		size := walk.SizeFrom96DPI(size96dpi, canvas.DPI())
-		bitmap, err := walk.NewBitmapFromIconForDPI(loadIcon(id, size.Width), size, canvas.DPI())
+		targetIcon := loadIcon(id, size.Width)
+		if targetIcon == nil {
+			return nil
+		}
+		bitmap, err := walk.NewBitmapFromIconForDPI(targetIcon, size, canvas.DPI())
 		if err != nil {
 			return err
 		}
