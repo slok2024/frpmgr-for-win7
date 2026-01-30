@@ -17,23 +17,10 @@ import (
 	"github.com/koho/frpmgr/ui"
 )
 
-func fatal(v ...interface{}) {
-	windows.MessageBox(0, windows.StringToUTF16Ptr(fmt.Sprint(v...)), windows.StringToUTF16Ptr(ui.AppLocalName), windows.MB_ICONERROR)
-	os.Exit(1)
-}
-
-func info(title string, format string, v ...interface{}) {
-	windows.MessageBox(0, windows.StringToUTF16Ptr(i18n.Sprintf(format, v...)), windows.StringToUTF16Ptr(title), windows.MB_ICONINFORMATION)
-}
-
-var (
-	confPath    string
-	showVersion bool
-	showHelp    bool
-	flagOutput  strings.Builder
-)
-
 func init() {
+	// 【核心修复】在 init 阶段第一时间设置，确保拦截所有延迟加载弹窗
+	windows.SetErrorMode(windows.SEM_FAILCRITICALERRORS | windows.SEM_NOOPENFILEERRORBOX)
+
 	flag.StringVar(&confPath, "c", "", "The path to config `file` (Service-only).")
 	flag.BoolVar(&showVersion, "v", false, "Display version information.")
 	flag.BoolVar(&showHelp, "h", false, "Show help information.")
@@ -42,6 +29,9 @@ func init() {
 }
 
 func main() {
+	// 针对 Windows 7 环境双重保险
+	windows.SetErrorMode(windows.SEM_FAILCRITICALERRORS | windows.SEM_NOOPENFILEERRORBOX)
+
 	if showHelp {
 		flag.Usage()
 		info(ui.AppLocalName, flagOutput.String())
@@ -79,3 +69,19 @@ func main() {
 		}
 	}
 }
+
+func fatal(v ...interface{}) {
+	windows.MessageBox(0, windows.StringToUTF16Ptr(fmt.Sprint(v...)), windows.StringToUTF16Ptr(ui.AppLocalName), windows.MB_ICONERROR)
+	os.Exit(1)
+}
+
+func info(title string, format string, v ...interface{}) {
+	windows.MessageBox(0, windows.StringToUTF16Ptr(i18n.Sprintf(format, v...)), windows.StringToUTF16Ptr(title), windows.MB_ICONINFORMATION)
+}
+
+var (
+	confPath    string
+	showVersion bool
+	showHelp    bool
+	flagOutput  strings.Builder
+)
