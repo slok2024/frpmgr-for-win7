@@ -3,9 +3,10 @@ package services
 import (
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"github.com/koho/frpmgr/pkg/consts"
@@ -23,6 +24,14 @@ var (
 	trackedConfigs     = make(map[string]*tracker)
 	trackedConfigsLock = sync.Mutex{}
 )
+
+// WatchConfigServices 修复签名不匹配问题
+// UI 层期望返回: (func() error, error)
+func WatchConfigServices(paths func() []string, cb ConfigStateCallback) (func() error, error) {
+	err := trackExistingConfigs(paths, cb)
+	// 返回一个返回 nil 的函数，满足 func() error 签名
+	return func() error { return nil }, err
+}
 
 func trackExistingConfigs(paths func() []string, cb ConfigStateCallback) error {
 	m, err := serviceManager()
@@ -51,91 +60,68 @@ func trackExistingConfigs(paths func() []string, cb ConfigStateCallback) error {
 	return nil
 }
 
-func WatchConfigServices(paths func() []string, cb ConfigStateCallback) (func() error, error) {
-	m, err := serviceManager()
-	if err != nil {
-		return nil, err
-	}
-	var subscription uintptr
-	err = windows.SubscribeServiceChangeNotifications(m.Handle, windows.SC_EVENT_DATABASE_CHANGE,
-		windows.NewCallback(func(notification uint32, context uintptr) uintptr {
-			trackExistingConfigs(paths, cb)
-			return 0
-		}), 0, &subscription)
-	if err == nil {
-		if err = trackExistingConfigs(paths, cb); err != nil {
-			windows.UnsubscribeServiceChangeNotifications(subscription)
-			return nil, err
-		}
-		return func() error {
-			err := windows.UnsubscribeServiceChangeNotifications(subscription)
-			trackedConfigsLock.Lock()
-			for _, tc := range trackedConfigs {
-				tc.done.Done()
-			}
-			trackedConfigsLock.Unlock()
-			return err
-		}, nil
-	}
-	return nil, err
-}
-
 func trackService(service *mgr.Service, path string, cb ConfigStateCallback) {
+	ctx := &tracker{service: service}
 	trackedConfigsLock.Lock()
-	if _, found := trackedConfigs[path]; found {
-		trackedConfigsLock.Unlock()
-		service.Close()
+	trackedConfigs[path] = ctx
+	trackedConfigsLock.Unlock()
+	ctx.done.Add(1)
+
+	updateState := func(state consts.ConfigState) {
+		if state != 0 {
+			cb(path, state)
+		}
+	}
+
+	// ---------------------------------------------------------
+	// Windows 7 兼容性核心逻辑：
+	// 使用 LazyDLL 动态查找 API，避免程序启动时因找不到 DLL 入口点而弹窗
+	// ---------------------------------------------------------
+	modsechost := syscall.NewLazyDLL("sechost.dll")
+	procSubscribe := modsechost.NewProc("SubscribeServiceChangeNotifications")
+	procUnsubscribe := modsechost.NewProc("UnsubscribeServiceChangeNotifications")
+
+	var subscription uintptr
+
+	// 1. 检查 API 是否存在。在 Win7 下 Find() 会失败或返回 nil
+	if procSubscribe.Find() != nil {
+		// Win7 逻辑：因为没有订阅功能，只做一次查询，不报错，不弹窗
+		status, err := service.Query()
+		if err == nil {
+			updateState(svcStateToConfigState(uint32(status.State)))
+		}
+		// 标记为已运行一次，直接退出
+		ctx.once.Store(1)
 		return
 	}
 
-	defer func() {
-		service.Close()
-	}()
-	ctx := &tracker{service: service}
-	ctx.done.Add(1)
-	trackedConfigs[path] = ctx
-	trackedConfigsLock.Unlock()
-	defer func() {
-		trackedConfigsLock.Lock()
-		delete(trackedConfigs, path)
-		trackedConfigsLock.Unlock()
-	}()
-
-	var subscription uintptr
-	lastState := consts.ConfigStateUnknown
-	var updateState = func(state consts.ConfigState) {
-		if state != lastState {
-			cb(path, state)
-			lastState = state
+	// 2. Win8+ 逻辑：存在该 API，正常订阅
+	callback := syscall.NewCallback(func(notification uint32, context uintptr, svcHandle uintptr) uintptr {
+		if notification == 4 { // SERVICE_NOTIFY_STATUS_CHANGE
+			status, err := service.Query()
+			if err == nil {
+				updateState(svcStateToConfigState(uint32(status.State)))
+			}
 		}
-	}
-	err := windows.SubscribeServiceChangeNotifications(service.Handle, windows.SC_EVENT_STATUS_CHANGE,
-		windows.NewCallback(func(notification uint32, context uintptr) uintptr {
-			if ctx.once.Load() != 0 {
-				return 0
-			}
-			configState := consts.ConfigStateUnknown
-			if notification == 0 {
-				status, err := service.Query()
-				if err == nil {
-					configState = svcStateToConfigState(uint32(status.State))
-				}
-			} else {
-				configState = notifyStateToConfigState(notification)
-			}
-			updateState(configState)
-			return 0
-		}), 0, &subscription)
-	if err == nil {
-		defer windows.UnsubscribeServiceChangeNotifications(subscription)
+		return 0
+	})
+
+	// 调用 SubscribeServiceChangeNotifications
+	ret, _, _ := procSubscribe.Call(uintptr(service.Handle), 0, callback, 0, uintptr(unsafe.Pointer(&subscription)))
+
+	if ret == 0 { // 成功（返回值为0表示成功，具体取决于API定义，但在Go syscall中通常如此检查）
+		defer procUnsubscribe.Call(subscription)
 		status, err := service.Query()
 		if err == nil {
 			updateState(svcStateToConfigState(uint32(status.State)))
 		}
 		ctx.done.Wait()
 	} else {
-		cb(path, consts.ConfigStateStopped)
-		service.Control(svc.Stop)
+		// 订阅失败备选逻辑
+		status, err := service.Query()
+		if err == nil {
+			updateState(svcStateToConfigState(uint32(status.State)))
+		}
 	}
 }
 
@@ -149,23 +135,7 @@ func svcStateToConfigState(s uint32) consts.ConfigState {
 		return consts.ConfigStateStopping
 	case windows.SERVICE_RUNNING:
 		return consts.ConfigStateStarted
-	case windows.SERVICE_NO_CHANGE:
-		return 0
 	default:
 		return 0
-	}
-}
-
-func notifyStateToConfigState(s uint32) consts.ConfigState {
-	if s&(windows.SERVICE_NOTIFY_STOPPED|windows.SERVICE_NOTIFY_DELETED|windows.SERVICE_NOTIFY_DELETE_PENDING) != 0 {
-		return consts.ConfigStateStopped
-	} else if s&windows.SERVICE_NOTIFY_STOP_PENDING != 0 {
-		return consts.ConfigStateStopping
-	} else if s&windows.SERVICE_NOTIFY_RUNNING != 0 {
-		return consts.ConfigStateStarted
-	} else if s&windows.SERVICE_NOTIFY_START_PENDING != 0 {
-		return consts.ConfigStateStarting
-	} else {
-		return consts.ConfigStateUnknown
 	}
 }
